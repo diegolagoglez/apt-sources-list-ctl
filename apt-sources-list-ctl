@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+
+import sys
+import argparse
+import re
+
+VERSION = '0.1.0-20190404'
+
+
+class APTSourcesFileLine:
+
+    def __init__(self, **kwargs):
+        self.type = kwargs['type']
+        self.uri = kwargs['uri']
+        self.suite = kwargs['suite']
+        self.components = [
+            component.strip() if component.strip() else None for component in kwargs['components'].split(' ')
+        ]
+        self.enabled = (not 'disabled' in kwargs) or not kwargs['disabled']
+        self.number = kwargs['number'] if 'number' in kwargs else -1
+        self._to_remove = False
+
+    def __str__(self):
+        return '{}{} {} {} {}'.format('# ' if not self.enabled else '',
+                                        self.type, self.uri, self.suite, ' '.join(self.components))
+
+    def __eq__(self, other):
+        if type(self) != type(other):
+            return False
+        return self.type == other.type and \
+            self.uri == other.uri and \
+            self.suite == other.suite and \
+            self.components == other.components and \
+            self.enabled == other.enabled
+
+    def parse(line, number=-1, filepath=None):
+        if not line.strip():
+            return ''
+        groups = re.match('(?P<disabled>\ *\#*\ *)?(?P<type>(deb|deb-src))\ +(?P<uri>.+?)\ +(?P<suite>.+?)'
+                          '\ +(?P<components>.+)', line)
+        if groups and groups.group('type') and groups.group('uri') and \
+            groups.group('suite') and groups.group('components'):
+            return APTSourcesFileLine(type=groups.group('type'),
+                                      uri=groups.group('uri'),
+                                      suite=groups.group('suite'),
+                                      components=groups.group('components'),
+                                      disabled=False if not groups.group('disabled') else True,
+                                      number=number)
+        elif re.match('\ *\#+.*', line):
+            return line  # It's a comment.
+        else:
+            raise Exception('Invalid line in {}:{}: {}'.format(filepath, number, line))
+
+
+class APTSourcesFile:
+
+    def _parse_file(self):
+        with open(self.path) as f:
+            lineno = 0
+            for line in f.readlines():
+                lineno += 1
+                line = line.rstrip('\n')
+                self.lines.append(APTSourcesFileLine.parse(line, lineno, self.path))
+
+    def _apt_line(self, line):
+        if type(line) == str:
+            return APTSourcesFileLine.parse(line)
+        return line
+
+    def _check_position(self, position):
+        if position < 0 or position >= self.count():
+            raise Exception("Index out of bounds (1..{}): {}".format(self.count(), position))
+
+    def __init__(self, path, *args, **kwargs):
+        self.path = path
+        self.lines = []
+        self._parse_file()
+
+    def __str__(self):
+        return '\n'.join([str(line) for line in self.lines])
+
+    def count(self):
+        return len(self.lines)
+
+    def count_enabled(self):
+        counter = 0
+        for line in self.lines:
+            if type(line) == APTSourcesFileLine and line.enabled:
+                counter += 1
+        return counter
+
+    def add(self, line, position=-1):
+        # TODO: Take into account the position if it's passed.
+        self.lines.append(self._apt_line(line))
+
+    def find(self, line):
+        line = self._apt_line(line)
+        for i, l in enumerate(self.lines):
+            if l == line:
+                return i
+        return -1
+
+    def remove(self, line):
+        index = self.find(line)
+        if index >= 0:
+            del self.lines[index]
+
+    def get(self, position):
+        self._check_position(position)
+        return self.lines[position-1]
+
+    def set(self, line, position):
+        self._check_position(position)
+        self.lines[position-1] = self._apt_line(line)
+
+    def find_duplicates(self):
+        l = self.count()
+        dups = []
+        for i, first in enumerate(self.lines):
+            for j in range(i, l):
+                second = self.lines[j]
+                if type(first) == str or type(second) == str:
+                    continue
+                if first.number == second.number:
+                    continue
+                if first == second:
+                    dups.append((i, j))  # Use i and j becuase first.number is i+1 and second.number is j+1
+        return dups
+
+    def check(self):
+        errors = []
+        for pair in self.find_duplicates():
+            errors.append('Duplicated line: {}:{}:{}'.format(self.path, pair[0]+1, pair[1]+1))
+        return errors
+
+    def remove_duplicates(self):
+        for pair in self.find_duplicates():
+            last = max(pair)
+            print(self.lines[last])
+            self.lines[last]._to_remove = True
+        new_lines = []
+        for line in self.lines:
+            if not type(line) == APTSourcesFileLine or not line._to_remove:
+                new_lines.append(line)
+        self.lines = new_lines
+        
+
+def print_error(message, exit_with_code=0):
+    print("ERROR: " + message, file=sys.stderr)
+    if exit_with_code > 0:
+        sys.exit(exit_with_code)
+
+
+def print_warning(message):
+    print("WARNING: " + message, file=sys.stderr)
+
+
+def process_arguments():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-f', '--file', metavar='FILE', dest='filepath', default='/etc/apt/sources.list',
+                        help='Set the file to parse (default: %(default)s).')
+    parser.add_argument('-q', '--quiet', action='store_false', dest='print',
+                        help='Do not print the parsed file after applying all the actions.')
+    parser.add_argument('-p', '--print', action='store_true', dest='print',
+                        help='Print the parsed file after applying all the actions.')
+    parser.add_argument('--action', dest='actions', action='append',
+                        choices=['check', 'remove-duplicates'],
+                        help='Specify actions to do on lines. Can be specified multiple times.')
+    parser.add_argument("--version", action='version', version='%(prog)s ' + VERSION,
+                        help='Show the program version and exits.')
+    return vars(parser.parse_args())
+
+
+def run_actions(args, aptfile):
+    if 'actions' in args and args['actions']:
+        for action in args['actions']:
+            print("Running: " + action)
+            if action == 'check':
+                errors = aptfile.check()
+                for err in errors:
+                    print_error(err)
+                if len(errors) > 0:
+                    raise Exception('Check failed.')
+            elif action == 'remove-duplicates':
+                aptfile.remove_duplicates()
+    return aptfile
+
+
+def main():
+    args = process_arguments()
+    try:
+        aptfile = APTSourcesFile(args['filepath'])
+        aptfile = run_actions(args, aptfile)
+        if 'print' in args and args['print']:
+            print(aptfile)
+    except Exception as e:
+        print_error(str(e))
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
